@@ -12,7 +12,7 @@
   - After $MaxRetries attempts, moves file to $DlqDir (dead-letter queue).
 
 .NOTES
-  - Requires PowerShell 7+ (Invoke-RestMethod improvements & reliable -TimeoutSec).
+  - Requires PowerShell 5.x
   - Provide $BaseDir, $GatewayHost etc. as parameters or use the provided defaults.
 #>
 
@@ -20,7 +20,7 @@
 # Command line parameters - with sensible defaults
 # -------------------------
 param (
-    [string]$BaseDir        = "$HOME/bms/sms",
+    [string]$BaseDir        = "D:\SMS",
     [string]$GatewayHost    = "https://198.1.1.237",
     [int]$MaxRetries        = 3,
     [switch]$RunContinuous    # if given the script will loop and sleep; otherwise processes current files then exits
@@ -29,35 +29,35 @@ param (
 # -------------------------
 # Configuration - edit as needed
 # -------------------------
-$LoginEndpoint        = "$GatewayHost/api/login"
-$SendEndpoint         = "$GatewayHost/api/messages/actions/send"
-$Modem                = "3-1"
-$Global:AuthToken     = $null # Global variable to hold token during run
-$RetryDelaySeconds    = 10      # base delay between retries
-$ReadyDir             = "$BaseDir/ready"
-$ProcessingDir        = "$BaseDir/processing"   # temporary lock/move location while processing
-$SentDir              = "$BaseDir/sent"
-$DlqDir               = "$BaseDir/dlq"
-$RetryFileExtension   = '.retry' # companion file storing attempt count (same filename + .retry)
-$SleepBetweenLoops    = 15       # seconds when running continuous
+$LoginEndpoint      = "$GatewayHost/api/login"
+$SendEndpoint       = "$GatewayHost/api/messages/actions/send"
+$Modem              = "3-1"
+$Global:AuthToken   = $null # Global variable to hold token during run
+$RetryDelaySeconds  = 10 # base delay between retries
+$ReadyDir           = "$BaseDir\ready"
+$ProcessingDir      = "$BaseDir\processing" # temporary lock/move location while processing
+$SentDir            = "$BaseDir\sent"
+$DlqDir             = "$BaseDir\dlq"
+$RetryFileExtension = '.retry' # companion file storing attempt count (same filename + .retry)
+$SleepBetweenLoops  = 15 # seconds when running continuous
 
 # -------------------------
 # Setup directories
 # -------------------------
 foreach ($d in @($ReadyDir, $ProcessingDir, $SentDir, $DlqDir)) {
-    if (-not (Test-Path $d)) {
-        New-Item -ItemType Directory -Path $d -Force | Out-Null
-    }
+  if (-not (Test-Path $d)) {
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+  }
 }
 
 # -------------------------
 # Get credentials for API calls
 # -------------------------
 # Save credential once
-# $cred = Get-Credential  # Enter <user_name> / <password>
+# $cred = Get-Credential # Enter <user_name> / <password>
 # $cred | Export-Clixml -Path "$HOME/.apiCred.xml"
 
-$cred = Import-Clixml -Path "$HOME/.apiCred.xml"
+$cred = Import-Clixml -Path ".\.apiCred.xml"
 $ApiUser = $cred.UserName
 $ApiPassword = $cred.GetNetworkCredential().Password
 
@@ -115,35 +115,30 @@ function Write-Log {
 # -------------------------
 function Get-AuthToken {
     if ($Global:AuthToken) {
-        return $Global:AuthToken
+      return $Global:AuthToken
     }
 
     $loginBody = @{
-        username = $ApiUser
-        password = $ApiPassword
+      username = $ApiUser
+      password = $ApiPassword
     } | ConvertTo-Json -Depth 3
 
     try {
-        $loginResponse = Invoke-RestMethod -Uri $LoginEndpoint `
-                                           -Method Post `
-                                           -Body $loginBody `
-                                           -ContentType "application/json" `
-                                           -SkipCertificateCheck `
-                                           -TimeoutSec 30
+      $loginResponse = Invoke-RestMethod -Uri $LoginEndpoint -Method Post -Body $loginBody -ContentType "application/json" -TimeoutSec 30
 
-        # Expecting { success: true, data: { username, token, expires } }
-        $token = $loginResponse.data.token
+      # Expecting { success: true, data: { username, token, expires } }
+      $token = $loginResponse.data.token
+      
+      if (-not $token) {
+        throw "Login succeeded but no bearer token found in response"
+      }
 
-        if (-not $token) {
-            throw "Login succeeded but no bearer token found in response"
-        }
-
-        $Global:AuthToken = $token
-        Write-Host "Obtained bearer token for $($loginResponse.data.username)." -ForegroundColor Cyan
-        return $token
-
+      $Global:AuthToken = $token
+      Write-Host "Obtained bearer token for $($loginResponse.data.username)." -ForegroundColor Cyan
+      
+      return $token
     } catch {
-        throw "Failed to login: $($_.Exception.Message)"
+      throw "Failed to login: $($_.Exception.Message)"
     }
 }
 
@@ -152,53 +147,49 @@ function Get-AuthToken {
 # -------------------------
 function Try-SendMessage {
     param(
-        [string]$Phone,
-        [string]$Text
+      [string]$Phone,
+      [string]$Text
     )
 
     $sendBody = @{
-        data = @{
-            number  = "$Phone"   # no leading + sign is required, it is the first character of the file name
-            message = $Text
-            modem   = $Modem
-        }
+      data = @{
+        number = "$Phone" # no leading + sign is required, it is the first character of the file name
+        message = $Text
+        modem = $Modem
+      }
     } | ConvertTo-Json -Depth 5
 
     $attemptedRelogin = $false
 
     while ($true) {
-        try {
-            $token = Get-AuthToken
-            
-            $headers = @{
-                "Authorization" = "Bearer $token"
-            }
+      try {
+        $token = Get-AuthToken
 
-            $sendResponse = Invoke-RestMethod -Uri $SendEndpoint `
-                                              -Method Post `
-                                              -Body $sendBody `
-                                              -ContentType "application/json" `
-                                              -Headers $headers `
-                                              -SkipCertificateCheck `
-                                              -TimeoutSec 30
-
-            return @{ Success = $true; Response = $sendResponse }
-        } catch {
-            $ex = $_.Exception
-            $statusCode = $null
-            if ($ex.Response -and $ex.Response.StatusCode) {
-                $statusCode = [int]$ex.Response.StatusCode
-            }
-
-            if ($statusCode -eq 401 -and -not $attemptedRelogin) {
-                Write-Host "Token expired, retrying login..." -ForegroundColor Yellow
-                $Global:AuthToken = $null  # clear old token
-                $attemptedRelogin = $true
-                continue  # retry loop with fresh token
-            }
-
-            return @{ Success = $false; Error = $ex.Message; Exception = $ex }
+        $headers = @{
+          "Authorization" = "Bearer $token"
+          "Content-Type" = "application/json"
         }
+
+        $sendResponse = Invoke-RestMethod -Uri $SendEndpoint -Method Post -Body $sendBody -ContentType "application/json" -Headers $headers -TimeoutSec 30
+        
+        return @{ Success = $true; Response = $sendResponse }
+      } catch {
+        $ex = $_.Exception
+        $statusCode = $null
+        if ($ex.Response -and $ex.Response.StatusCode) {
+          $statusCode = [int]$ex.Response.StatusCode
+        }
+
+        if ($statusCode -eq 401 -and -not $attemptedRelogin) {
+          Write-Host "Token expired, retrying login..." -ForegroundColor Yellow
+          $Global:AuthToken = $null # clear old token
+          $attemptedRelogin = $true
+          
+          continue # retry loop with fresh token
+        }
+
+        return @{ Success = $false; Error = $ex.Message; Exception = $ex }
+      }
     }
 }
 
@@ -289,11 +280,17 @@ function Process-ReadyFiles {
 # -------------------------
 # Run once or continuously
 # -------------------------
+
+# Skip Certificate check and use TLS v1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
 do {
-    Process-ReadyFiles
-    if ($RunContinuous) {
-        Start-Sleep -Seconds $SleepBetweenLoops
-    }
+  Process-ReadyFiles
+  if ($RunContinuous) {
+    Start-Sleep -Seconds $SleepBetweenLoops
+  }
 } while ($RunContinuous)
 
 Write-Host "Processing finished (RunContinuous = $RunContinuous)."
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $null }
